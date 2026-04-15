@@ -611,3 +611,142 @@ class TestPipelineClear(TestCaseWithSimulator):
 
         with self.run_simulation(m) as sim:
             sim.add_testbench(tester)
+
+
+# ---------------------------------------------------------------------------
+# Conditional consume/produce control in stage return
+# ---------------------------------------------------------------------------
+
+
+class ConditionalStagePipeline(Elaboratable):
+    """Pipeline using $consume/$produce control keys in stage output."""
+
+    def __init__(self):
+        self.write = Method(i=[("data", unsigned(8))])
+        self.read = Method(o=[("data", unsigned(8))])
+
+    def elaborate(self, platform):
+        m = TModule()
+
+        m.submodules.pipeline = p = PipelineBuilder(allow_unused=True)
+        p.add_external(self.write)
+
+        emit_counter = Signal(range(4))
+
+        @p.stage(m, o=[("data", unsigned(8))])
+        def _(data):
+            should_consume = emit_counter == 2
+            should_produce = emit_counter < 2
+
+            with m.If(emit_counter == 2):
+                m.d.sync += emit_counter.eq(0)
+            with m.Else():
+                m.d.sync += emit_counter.eq(emit_counter + 1)
+
+            return {
+                "data": data + emit_counter,
+                "$consume": should_consume,
+                "$produce": should_produce,
+            }
+
+        p.add_external(self.read)
+
+        return m
+
+
+class FilterStagePipeline(Elaboratable):
+    """Pipeline that consumes all inputs but produces only odd inputs."""
+
+    def __init__(self):
+        self.write = Method(i=[("data", unsigned(8))])
+        self.read = Method(o=[("data", unsigned(8))])
+
+    def elaborate(self, platform):
+        m = TModule()
+
+        m.submodules.pipeline = p = PipelineBuilder(allow_unused=True)
+        p.add_external(self.write)
+
+        @p.stage(m, o=[("data", unsigned(8))])
+        def _(data):
+            return {
+                "data": data,
+                "$consume": C(1),
+                "$produce": data[0],
+            }
+
+        p.add_external(self.read)
+
+        return m
+
+
+class NoOpStagePipeline(Elaboratable):
+    """Pipeline with consume=0, produce=0 no-op cycles before normal flow."""
+
+    def __init__(self):
+        self.write = Method(i=[("data", unsigned(8))])
+        self.read = Method(o=[("data", unsigned(8))])
+
+    def elaborate(self, platform):
+        m = TModule()
+
+        m.submodules.pipeline = p = PipelineBuilder(allow_unused=True)
+        p.add_external(self.write)
+
+        warmup = Signal(range(3))
+
+        @p.stage(m, o=[("data", unsigned(8))])
+        def _(data):
+            with m.If(warmup < 2):
+                m.d.sync += warmup.eq(warmup + 1)
+
+            return {
+                "data": data + 10,
+                "$consume": warmup == 2,
+                "$produce": warmup == 2,
+            }
+
+        p.add_external(self.read)
+
+        return m
+
+
+class TestConditionalStageControl(TestCaseWithSimulator):
+    @pytest.mark.xfail(reason="one-to-many repeated emission from retained input needs scheduler support")
+    def test_one_to_many_retry_then_consume(self):
+        m = SimpleTestCircuit(ConditionalStagePipeline())
+
+        async def tester(sim: TestbenchContext):
+            await m.write.call(sim, data=7)
+
+            seen: list[int] = []
+            for _ in range(20):
+                result = await m.read.call_try(sim)
+                if result is not None:
+                    seen.append(result.data)
+                    if len(seen) == 2:
+                        break
+                await sim.tick()
+
+            assert seen == [7, 8]
+            assert await m.read.call_try(sim) is None
+
+        with self.run_simulation(m) as sim:
+            sim.add_testbench(tester)
+
+    def test_filter_consume_without_produce(self):
+        m = SimpleTestCircuit(FilterStagePipeline())
+
+        async def writer(sim: TestbenchContext):
+            for i in range(8):
+                await m.write.call(sim, data=i)
+
+        async def reader(sim: TestbenchContext):
+            for i in [1, 3, 5, 7]:
+                result = await m.read.call(sim)
+                assert result.data == i
+            assert await m.read.call_try(sim) is None
+
+        with self.run_simulation(m) as sim:
+            sim.add_testbench(writer)
+            sim.add_testbench(reader)

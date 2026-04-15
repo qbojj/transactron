@@ -1,14 +1,14 @@
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from inspect import Parameter, signature
-from typing import Optional, Protocol, final
+from typing import Optional, Protocol, final, TypeAlias
 
 from amaranth import *
 from amaranth.lib.data import StructLayout
 from amaranth_types import ShapeLike, SrcLoc, ValueLike
 
 from transactron.core import Method, TModule, def_method, Provided
-from transactron.lib.connectors import ConnectTrans, Pipe, ClearableConnector
+from transactron.lib.connectors import ConnectTrans, Pipe, Forwarder, ClearableConnector
 from transactron.lib.fifo import BasicFifo
 from transactron.utils import MethodLayout, from_method_layout
 from transactron.utils.assign import AssignArg, AssignType, assign
@@ -102,12 +102,23 @@ class PipelineBuilder(Elaboratable):
 
     clear: Provided[Method]
 
+    _STAGE_CTRL_CONSUME_KEY = "$consume"
+    _STAGE_CTRL_PRODUCE_KEY = "$produce"
+    _STAGE_CTRL_CONSUME_FIELD = "__pipeline_ctrl_consume"
+    _STAGE_CTRL_PRODUCE_FIELD = "__pipeline_ctrl_produce"
+
+    _ControlExpr: TypeAlias = ValueLike | Callable[[Mapping[str, ValueLike], Mapping[str, ValueLike]], ValueLike]
+
     @dataclass
     class _NodeInfo:
         node: _PipelineNodeProtocol
         src_loc: SrcLoc
         ready: ValueLike
         no_dependency: bool
+        consume: "PipelineBuilder._ControlExpr"
+        produce: "PipelineBuilder._ControlExpr"
+        hidden_generated_fields: frozenset[str]
+        has_custom_forwarder: bool
         forwarder: Callable[[MethodLayout], ClearableConnector]
 
     def __init__(self, allow_unused: bool = False, allow_empty: bool = False):
@@ -139,6 +150,8 @@ class PipelineBuilder(Elaboratable):
         *,
         ready: ValueLike = C(1),
         no_dependency: bool = False,
+        consume: _ControlExpr = C(1),
+        produce: _ControlExpr = C(1),
         src_loc: int | SrcLoc = 0,
     ) -> None:
         """Add a node where the pipeline provides (defines the body of) a ``Method``.
@@ -158,6 +171,14 @@ class PipelineBuilder(Elaboratable):
             The node will be decoupled from the pipeline. Such nodes cannot have required input signals.
             For more information, see :class:`~transactron.lib.pipeline.PipelineBuilder`.
             Default: ``False``.
+        consume : ValueLike | Callable[[Mapping[str, ValueLike], Mapping[str, ValueLike]], ValueLike]
+            Per-invocation consume control. If true, current input state is consumed.
+            If false, input state is retained and retried on later invocations.
+            Default: always consume.
+        produce : ValueLike | Callable[[Mapping[str, ValueLike], Mapping[str, ValueLike]], ValueLike]
+            Per-invocation produce control. If true, current invocation emits an output
+            element to the next pipeline node. If false, no output element is produced.
+            Default: always produce.
         src_loc : int | SrcLoc
             Source location for debugging. Default: ``0``.
 
@@ -166,7 +187,14 @@ class PipelineBuilder(Elaboratable):
         None
         """
         node = _ProvidedMethodNode(method)
-        self._add_node(node, ready, no_dependency=no_dependency, src_loc=get_src_loc(src_loc))
+        self._add_node(
+            node,
+            ready,
+            no_dependency=no_dependency,
+            consume=consume,
+            produce=produce,
+            src_loc=get_src_loc(src_loc),
+        )
 
     def create_external(
         self,
@@ -210,6 +238,9 @@ class PipelineBuilder(Elaboratable):
         *,
         ready: ValueLike = C(1),
         no_dependency: bool = False,
+        consume: _ControlExpr = C(1),
+        produce: _ControlExpr = C(1),
+        hidden_generated_fields: Optional[set[str]] = None,
         src_loc: int | SrcLoc = 0,
     ) -> None:
         """Add a node where the pipeline calls an existing ``Method``.
@@ -232,6 +263,17 @@ class PipelineBuilder(Elaboratable):
             The node will be decoupled from the pipeline. Such nodes cannot have required input signals.
             For more information, see :class:`~transactron.lib.pipeline.PipelineBuilder`.
             Default: ``False``.
+        consume : ValueLike | Callable[[Mapping[str, ValueLike], Mapping[str, ValueLike]], ValueLike]
+            Per-invocation consume control. If true, current input state is consumed.
+            If false, input state is retained and retried on later invocations.
+            Default: always consume.
+        produce : ValueLike | Callable[[Mapping[str, ValueLike], Mapping[str, ValueLike]], ValueLike]
+            Per-invocation produce control. If true, current invocation emits an output
+            element to the next pipeline node. If false, no output element is produced.
+            Default: always produce.
+        hidden_generated_fields : Optional[set[str]]
+            Internal-use field names produced by ``method`` that should not become
+            part of live pipeline state.
         src_loc : int | SrcLoc
             Source location for debugging. Default: ``0``.
 
@@ -240,7 +282,15 @@ class PipelineBuilder(Elaboratable):
         None
         """
         node = _CalledMethodNode(method)
-        self._add_node(node, ready, no_dependency=no_dependency, src_loc=get_src_loc(src_loc))
+        self._add_node(
+            node,
+            ready,
+            no_dependency=no_dependency,
+            consume=consume,
+            produce=produce,
+            hidden_generated_fields=hidden_generated_fields,
+            src_loc=get_src_loc(src_loc),
+        )
 
     def stage(
         self,
@@ -342,15 +392,98 @@ class PipelineBuilder(Elaboratable):
 
             o_layout = from_method_layout(o)
 
+            ctrl_keys = {
+                self._STAGE_CTRL_CONSUME_KEY,
+                self._STAGE_CTRL_PRODUCE_KEY,
+                self._STAGE_CTRL_CONSUME_FIELD,
+                self._STAGE_CTRL_PRODUCE_FIELD,
+            }
+            collisions = ctrl_keys & set(o_layout.members.keys())
+            if collisions:
+                raise ValueError(f"Pipeline stage output layout uses reserved control keys: {collisions}")
+
+            full_o_layout = StructLayout(
+                {
+                    **o_layout.members,
+                    self._STAGE_CTRL_CONSUME_FIELD: unsigned(1),
+                    self._STAGE_CTRL_PRODUCE_FIELD: unsigned(1),
+                }
+            )
+
             method = Method(
                 name=name or f"pipeline_stage_{len(self._nodes)}",
                 i=i_layout,
-                o=o_layout,
+                o=full_o_layout,
                 src_loc=src_loc,
             )
-            def_method(m, method)(func)
 
-            self.call_method(method, src_loc=src_loc, **kwargs)
+            def wrapped_stage(*args, **kwargs):
+                ret = func(*args, **kwargs)
+
+                if ret is None:
+                    payload = {}
+                elif isinstance(ret, Mapping):
+                    payload = dict(ret)
+                else:
+                    if len(o_layout.members) == 1:
+                        only_name = next(iter(o_layout.members.keys()))
+                        payload = {only_name: ret}
+                    else:
+                        raise TypeError(
+                            "Pipeline stage must return a mapping (or None) when using multi-field outputs"
+                        )
+
+                consume = payload.pop(self._STAGE_CTRL_CONSUME_KEY, C(1))
+                produce = payload.pop(self._STAGE_CTRL_PRODUCE_KEY, C(1))
+
+                payload[self._STAGE_CTRL_CONSUME_FIELD] = consume
+                payload[self._STAGE_CTRL_PRODUCE_FIELD] = produce
+
+                return payload
+
+            def_method(m, method)(wrapped_stage)
+
+            def stage_consume(arg, _state):
+                return arg[self._STAGE_CTRL_CONSUME_FIELD]
+
+            def stage_produce(arg, _state):
+                return arg[self._STAGE_CTRL_PRODUCE_FIELD]
+
+            consume_ctrl = kwargs.pop("consume", C(1))
+            produce_ctrl = kwargs.pop("produce", C(1))
+
+            if callable(consume_ctrl):
+                user_consume = consume_ctrl
+
+                def consume_ctrl(arg, state):
+                    return stage_consume(arg, state) & user_consume(arg, state)
+
+            else:
+                consume_const = consume_ctrl
+
+                def consume_ctrl(arg, state):
+                    return stage_consume(arg, state) & consume_const
+
+            if callable(produce_ctrl):
+                user_produce = produce_ctrl
+
+                def produce_ctrl(arg, state):
+                    return stage_produce(arg, state) & user_produce(arg, state)
+
+            else:
+                produce_const = produce_ctrl
+
+                def produce_ctrl(arg, state):
+                    return stage_produce(arg, state) & produce_const
+
+            self.call_method(
+                method,
+                consume=consume_ctrl,
+                produce=produce_ctrl,
+                hidden_generated_fields={self._STAGE_CTRL_CONSUME_FIELD, self._STAGE_CTRL_PRODUCE_FIELD},
+                src_loc=src_loc,
+                **kwargs,
+            )
 
         return decorator
 
@@ -426,7 +559,11 @@ class PipelineBuilder(Elaboratable):
             node = self._nodes[i]
             live_per_node.append(live.copy())
 
-            gen = node.node.get_generated_fields().members
+            gen = {
+                k: v
+                for k, v in node.node.get_generated_fields().members.items()
+                if k not in node.hidden_generated_fields
+            }
             req = node.node.get_required_fields().members
 
             if not self.allow_unused:
@@ -464,6 +601,7 @@ class PipelineBuilder(Elaboratable):
         m = TModule()
 
         clear_methods = self._clear_methods.copy()
+        hold_valid_signals: list[Signal] = []
 
         live_types = self.get_live_signals()
 
@@ -481,28 +619,100 @@ class PipelineBuilder(Elaboratable):
 
             in_layout = node.node.get_generated_fields()
             out_layout = node.node.get_required_fields()
+            state_layout = read_method.layout_out if read_method is not None else from_method_layout(())
+
+            hold = Signal(state_layout, name=f"{i}_pipeline_hold")
+            hold_valid = Signal(name=f"{i}_pipeline_hold_valid")
+            hold_valid_signals.append(hold_valid)
 
             stage_method = Method(name=f"{i}_pipeline_combiner", i=in_layout, o=out_layout)
 
+            def eval_control(
+                control: PipelineBuilder._ControlExpr,
+                generated: Mapping[str, ValueLike],
+                required: Mapping[str, ValueLike],
+            ) -> ValueLike:
+                return control(generated, required) if callable(control) else control
+
             @def_method(m, stage_method, ready=node.ready)
             def _(arg):
-                in_data = read_method(m) if read_method is not None else dict()
-                out_data = Signal(out_layout)
+                legacy_mode = False
+                if not callable(node.consume) and not callable(node.produce):
+                    consume_const = Value.cast(node.consume)
+                    produce_const = Value.cast(node.produce)
+                    legacy_mode = (
+                        not node.hidden_generated_fields
+                        and isinstance(consume_const, Const)
+                        and consume_const.value == 1
+                        and isinstance(produce_const, Const)
+                        and produce_const.value == 1
+                    )
+
+                if legacy_mode:
+                    in_data = read_method(m) if read_method is not None else dict()
+                    out_data = Signal(out_layout)
+                    if out_layout.members:
+                        m.d.top_comb += assign(out_data, in_data, fields=AssignType.LHS)
+
+                    if write_method is not None:
+                        collected = Signal(write_method.layout_in)
+
+                        for k in write_method.layout_in.members.keys():
+                            if k in in_layout.members.keys():
+                                m.d.top_comb += collected[k].eq(arg[k])
+                            else:
+                                m.d.top_comb += collected[k].eq(in_data[k])
+
+                        _ = write_method(m, collected)
+
+                    return out_data
+
+                state_data = Signal(state_layout)
+                req_data = Signal(out_layout)
+
+                if state_layout.members:
+                    with m.If(hold_valid):
+                        m.d.top_comb += assign(state_data, hold, fields=AssignType.LHS)
+                    with m.Else():
+                        if read_method is None:
+                            raise RuntimeError("Pipeline node requires input state, but no read method is available")
+                        m.d.top_comb += assign(state_data, read_method(m), fields=AssignType.LHS)
+
                 if out_layout.members:
-                    m.d.top_comb += assign(out_data, in_data, fields=AssignType.LHS)
+                    m.d.top_comb += assign(req_data, state_data, fields=AssignType.LHS)
+
+                consume = Value.cast(eval_control(node.consume, arg, state_data))
+                produce = Value.cast(eval_control(node.produce, arg, state_data))
+                always_produce = False
+                if not callable(node.produce):
+                    produce_const = Value.cast(node.produce)
+                    if isinstance(produce_const, Const) and produce_const.value == 1:
+                        always_produce = True
 
                 if write_method is not None:
                     collected = Signal(write_method.layout_in)
 
                     for k in write_method.layout_in.members.keys():
-                        if k in in_layout.members.keys():
+                        if k in in_layout.members.keys() and k not in node.hidden_generated_fields:
                             m.d.top_comb += collected[k].eq(arg[k])
                         else:
-                            m.d.top_comb += collected[k].eq(in_data[k])
+                            m.d.top_comb += collected[k].eq(state_data[k])
 
-                    _ = write_method(m, collected)
+                    if always_produce:
+                        _ = write_method(m, collected)
+                    else:
+                        with m.If(produce):
+                            _ = write_method(m, collected)
 
-                return out_data
+                if state_layout.members:
+                    with m.If(~consume):
+                        with m.If(~hold_valid):
+                            m.d.sync += assign(hold, state_data, fields=AssignType.LHS)
+                            m.d.sync += hold_valid.eq(1)
+                    with m.Else():
+                        m.d.sync += hold_valid.eq(0)
+
+                return req_data
 
             if node.no_dependency:
                 m.submodules[f"{i}_nodep"] = nodep = Pipe(stage_method.layout_in)
@@ -515,12 +725,19 @@ class PipelineBuilder(Elaboratable):
 
         for i in range(1, len(self._nodes)):
             node = self._nodes[i]
+            prev_node = self._nodes[i - 1]
             prev_write = write_methods[i - 1]
             curr_read = read_methods[i]
             assert curr_read is not None
             assert prev_write is not None
 
-            m.submodules[f"{i}_forwarder"] = fwd = node.forwarder(prev_write.layout_in)
+            dynamic_controls = callable(prev_node.consume) or callable(prev_node.produce)
+            if dynamic_controls and not node.has_custom_forwarder:
+                fwd = Forwarder(prev_write.layout_in)
+            else:
+                fwd = node.forwarder(prev_write.layout_in)
+
+            m.submodules[f"{i}_forwarder"] = fwd
             prev_write.provide(fwd.write)
             curr_read.provide(fwd.read)
 
@@ -528,6 +745,8 @@ class PipelineBuilder(Elaboratable):
 
         @def_method(m, self.clear)
         def _():
+            for hold_valid in hold_valid_signals:
+                m.d.sync += hold_valid.eq(0)
             for clear_method in clear_methods:
                 _ = clear_method(m)
 
@@ -539,9 +758,19 @@ class PipelineBuilder(Elaboratable):
         ready: ValueLike,
         no_dependency: bool,
         src_loc: SrcLoc,
+        consume: _ControlExpr,
+        produce: _ControlExpr,
+        hidden_generated_fields: Optional[set[str]] = None,
     ) -> None:
         gen = node.get_generated_fields().members
         req = node.get_required_fields().members
+        hidden_generated_fields = hidden_generated_fields or set()
+
+        unknown_hidden = set(hidden_generated_fields) - set(gen.keys())
+        if unknown_hidden:
+            raise ValueError(f"Hidden generated fields {unknown_hidden} are not generated by node")
+
+        effective_gen = {k: v for k, v in gen.items() if k not in hidden_generated_fields}
 
         if no_dependency and req:
             raise ValueError("No-dependency nodes cannot have required signals")
@@ -559,6 +788,7 @@ class PipelineBuilder(Elaboratable):
             return Pipe(layout, src_loc=src_loc)
 
         forwarder = self._next_forwarder or pipe_forwarder
+        has_custom_forwarder = self._next_forwarder is not None
         self._next_forwarder = None
 
         self._nodes.append(
@@ -567,8 +797,12 @@ class PipelineBuilder(Elaboratable):
                 src_loc=src_loc,
                 ready=ready,
                 no_dependency=no_dependency,
+                consume=consume,
+                produce=produce,
+                hidden_generated_fields=frozenset(hidden_generated_fields),
+                has_custom_forwarder=has_custom_forwarder,
                 forwarder=forwarder,
             )
         )
 
-        self._live_signal_shapes.update(gen)
+        self._live_signal_shapes.update(effective_gen)
