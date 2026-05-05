@@ -50,7 +50,9 @@ class MethodMap:
     def __init__(self, transactions: Iterable[Transaction], methods: Iterable[Method]):
         self.methods_by_transaction = dict[TBody, list[MBody]]()
         self.transactions_by_method = dict[MBody, list[TBody]]()
-        self.info_by_call = defaultdict[tuple[TBody, MBody], list[CallInfo]](list)
+        self.called_from = dict[Body, list[MBody]]()
+        self.called_by = dict[MBody, list[Body]]()
+        self.info_by_call = defaultdict[tuple[Body, MBody], list[CallInfo]](list)
         self.method_parents = defaultdict[MBody, list[Body]](list)
 
         def path_str(path: Sequence[MBody]) -> str:
@@ -101,7 +103,7 @@ class MethodMap:
             rec_root(root, (), ())
 
         def rec(
-            transaction: TBody,
+            body: Body,
             source: Body,
             ancestors: tuple[MBody, ...],
             call_path: tuple[CtrlPath, ...],
@@ -114,7 +116,7 @@ class MethodMap:
                     new_call_path = (*call_path, call_ctrl_path)
                     new_call_enable = call_enable & enable_sig
 
-                    self.info_by_call[(transaction, method)].append(
+                    self.info_by_call[(body, method)].append(
                         CallInfo(
                             ancestors=new_ancestors,
                             call_path=new_call_path,
@@ -123,20 +125,30 @@ class MethodMap:
                         )
                     )
 
-                    if method not in self.methods_by_transaction[transaction]:
-                        self.methods_by_transaction[transaction].append(method)
-                        self.transactions_by_method[method].append(transaction)
-                    rec(transaction, method, new_ancestors, new_call_path, new_call_enable)
+                    if method not in self.called_from[body]:
+                        self.called_from[body].append(method)
+                        self.called_by[method].append(body)
+                    rec(body, method, new_ancestors, new_call_path, new_call_enable)
 
         for obj in chain(methods, transactions):
             validate_root_call_tree(obj._body)
 
-        for method in methods:
-            self.transactions_by_method[MBody(method._body)] = []
+        for obj in transactions:
+            self.called_from[obj._body] = []
+            self.methods_by_transaction[obj._body] = []
 
-        for transaction in transactions:
-            self.methods_by_transaction[TBody(transaction._body)] = []
-            rec(TBody(transaction._body), transaction._body, (), (), C(1))
+        for obj in methods:
+            self.called_from[obj._body] = []
+            self.called_by[obj._body] = []
+            self.transactions_by_method[obj._body] = []
+
+        for obj in chain(methods, transactions):
+            rec(obj._body, obj._body, (), (), C(1))
+
+        for obj in transactions:
+            for method in self.called_from[obj._body]:
+                self.methods_by_transaction[obj._body].append(method)
+                self.transactions_by_method[method].append(obj._body)
 
         for transaction_or_method in self.methods_and_transactions:
             for method in transaction_or_method.method_calls.keys():
@@ -165,9 +177,9 @@ class MethodMap:
     def called_methods(self) -> Collection[MBody]:
         return [method for method, transactions in self.transactions_by_method.items() if transactions]
 
-    def ready_for_transaction(self, trans: TBody) -> Collection[Body]:
+    def ready_for_body(self, body: Body) -> Collection[Body]:
         # all bodies that need to be ready for transaction to run
-        return [trans] + self.methods_by_transaction[trans]
+        return [body] + self.called_from[body]
 
 
 class TransactionManager(Elaboratable):
@@ -196,8 +208,8 @@ class TransactionManager(Elaboratable):
 
     @staticmethod
     def _transactions_exclusive(method_map: MethodMap, trans1: TBody, trans2: TBody):
-        tms1 = method_map.ready_for_transaction(trans1)
-        tms2 = method_map.ready_for_transaction(trans2)
+        tms1 = method_map.ready_for_body(trans1)
+        tms2 = method_map.ready_for_body(trans2)
 
         # if first transaction is exclusive with the second transaction, or this is true for
         # any called methods, the transactions will never run at the same time
@@ -492,37 +504,35 @@ class TransactionManager(Elaboratable):
         for method in chain(provided_methods):
             m.d.comb += method.ready.eq(method._body.ready)
             m.d.comb += method.run.eq(method._body.run)
+            m.d.comb += method.runnable.eq(method._body.runnable)
             m.d.comb += method.data_in.eq(method._body.data_in)
             m.d.comb += method.data_out.eq(method._body.data_out)
 
-        for transaction in method_map.transactions:
+        for body in method_map.methods_and_transactions:
 
-            def validate_args_for_method(method: MBody):
-                calls = method_map.info_by_call[(transaction, method)]
+            def validate_args_for_method(method: MBody, calls):
                 arg_rec = Signal.like(method.data_in)
                 en = Signal()
 
-                # Only one call can be active per method and transaction due to call-path exclusivity.
-                for i in OneHotSwitchDynamic(m, Cat(call.enable for call in calls)):
-                    m.d.comb += arg_rec.eq(calls[i].arg)
-                    m.d.comb += en.eq(1)
+                if len(calls) == 1:
+                    m.d.comb += arg_rec.eq(calls[0][1])
+                    m.d.comb += en.eq(calls[0][2])
+                else:
+                    # Only one call can be active per method and transaction due to call-path exclusivity.
+                    for i in OneHotSwitchDynamic(m, Cat(call[2] for call in calls)):
+                        m.d.comb += arg_rec.eq(calls[i][1])
+                        m.d.comb += en.eq(1)
 
                 return method._validate_arguments(en, arg_rec)
 
             runnable_terms = [
-                validate_args_for_method(method) for method in method_map.methods_by_transaction[transaction]
+                validate_args_for_method(method._body, calls) for method, calls in body.method_calls.items()
             ]
+            runnable_terms.extend(called.ready for called in method_map.ready_for_body(body))
             runnable_terms.extend(
-                dep.run for body in method_map.ready_for_transaction(transaction) for dep in ready_dependencies[body]
+                dep.run for body in method_map.ready_for_body(body) for dep in ready_dependencies[body]
             )
-            m.d.comb += transaction.runnable.eq(Cat(runnable_terms).all())
-
-        for method, transactions in method_map.transactions_by_method.items():
-            granted = Cat(
-                transaction.run & Cat(call.enable for call in method_map.info_by_call[(transaction, method)]).any()
-                for transaction in transactions
-            )
-            m.d.comb += method.run.eq(granted.any())
+            m.d.comb += body.runnable.eq(Cat(runnable_terms).all())
 
         ccs = _graph_ccs(cgr)
         (method_args, method_runs) = self._method_calls(m, method_map)
@@ -531,6 +541,7 @@ class TransactionManager(Elaboratable):
             if method.single_caller and len(method_args[method]) > 1:
                 raise RuntimeError(f"Single-caller method '{method.name}' {method.src_loc} called more than once")
             runs = Cat(method_runs[method])
+            m.d.comb += method.run.eq(runs.any())
             m.d.comb += assign(method.data_in, method.combiner(m, method_args[method], runs), fields=AssignType.ALL)
 
         m.submodules._transactron_schedulers = ModuleConnector(

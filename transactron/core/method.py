@@ -98,6 +98,7 @@ class Method(TransactionBase["Transaction | Method"]):
         self.name = name or tracer.get_var_name(depth=2, default=owner_name)
         self.ready = Signal(name=self.owned_name + "_ready")
         self.run = Signal(name=self.owned_name + "_run")
+        self.runnable = Signal(name=self.owned_name + "_runnable")
         self.data_in: MethodStruct = Signal(from_method_layout(i), name=self.owned_name + "_data_in")
         self.data_out: MethodStruct = Signal(from_method_layout(o), name=self.owned_name + "_data_out")
 
@@ -251,6 +252,7 @@ class Method(TransactionBase["Transaction | Method"]):
         # - This simulates faster in pysim.
         m.d.top_comb += self.ready.eq(body.ready)
         m.d.top_comb += self.run.eq(body.run)
+        m.d.top_comb += self.runnable.eq(body.runnable)
         m.d.top_comb += self.data_in.eq(body.data_in)
         m.d.top_comb += self.data_out.eq(body.data_out)
 
@@ -334,7 +336,7 @@ class Method(TransactionBase["Transaction | Method"]):
         return "(method {})".format(self.name)
 
     def debug_signals(self) -> ValueBundle:
-        return [self.ready, self.run, self.data_in, self.data_out]
+        return [self.ready, self.run, self.runnable, self.data_in, self.data_out]
 
 
 class Methods(Sequence[Method]):
