@@ -512,7 +512,7 @@ class TransactionManager(Elaboratable):
             m.d.comb += method.data_in.eq(method._body.data_in)
             m.d.comb += method.data_out.eq(method._body.data_out)
 
-        trivial_args_valid = set()
+        trivial_args_valid = set[MBody]()
 
         to_check = {method for method in method_map.methods if method.validate_arguments is None}
         while to_check:
@@ -527,6 +527,7 @@ class TransactionManager(Elaboratable):
                     if (
                         caller.validate_arguments is None
                         and caller not in trivial_args_valid
+                        and caller not in to_check
                         and caller in method_map.methods
                     ):
                         to_check.add(MBody(caller))
@@ -544,7 +545,7 @@ class TransactionManager(Elaboratable):
             # have arguments valid and are runnable.
             args_valid = []
             for method, calls in body.method_calls.items():
-                if method in trivial_args_valid:
+                if method._body in trivial_args_valid:
                     continue
 
                 called = Cat(enable for _, _, enable in calls).any()
