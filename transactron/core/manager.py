@@ -512,25 +512,20 @@ class TransactionManager(Elaboratable):
             m.d.comb += method.data_in.eq(method._body.data_in)
             m.d.comb += method.data_out.eq(method._body.data_out)
 
-        trivial_args_valid = set[MBody]()
-
-        to_check = {method for method in method_map.methods if method.validate_arguments is None}
+        trivial_args_valid = set[Body]()
+        to_check: set[Body] = {method for method in method_map.methods if method.validate_arguments is None}
         while to_check:
-            method = to_check.pop()
-            if method in trivial_args_valid:
+            body = to_check.pop()
+            if body in trivial_args_valid:
                 continue
 
-            if all(callee in trivial_args_valid for callee in method.method_calls.keys()):
-                trivial_args_valid.add(method)
+            if all(callee in trivial_args_valid for callee in body.method_calls.keys()):
+                trivial_args_valid.add(body)
 
-                for caller in method_map.method_parents[method]:
-                    if (
-                        caller.validate_arguments is None
-                        and caller not in trivial_args_valid
-                        and caller not in to_check
-                        and caller in method_map.methods
-                    ):
-                        to_check.add(MBody(caller))
+                if body in method_map.methods:
+                    for caller in method_map.method_parents[MBody(body)]:
+                        if caller.validate_arguments is None:
+                            to_check.add(caller)
 
         for body in method_map.methods_and_transactions:
             # body is allocatable iif it is ready, all its ready dependencies are running
