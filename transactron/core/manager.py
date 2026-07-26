@@ -525,7 +525,7 @@ class TransactionManager(Elaboratable):
 
                 for caller in method_map.method_parents[method]:
                     if (
-                        caller.validate_arguments is not None
+                        caller.validate_arguments is None
                         and caller not in trivial_args_valid
                         and caller in method_map.methods
                     ):
