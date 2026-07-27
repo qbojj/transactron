@@ -510,16 +510,35 @@ class TransactionManager(Elaboratable):
             m.d.comb += method.data_in.eq(method._body.data_in)
             m.d.comb += method.data_out.eq(method._body.data_out)
 
+        # each call site to a method with validate_arguments generates a validation circuit
+        args_valid_for_body = {}
+        for body in method_map.methods_and_transactions:
+            args_valid_terms = []
+            for method, calls in body.method_calls.items():
+                if method._body.validate_arguments is None:
+                    continue
+
+                args_valid_terms.extend(
+                    ~enable | method._body._validate_arguments(arg_rec) for _, arg_rec, enable in calls
+                )
+
+            if args_valid_terms:
+                args_valid_for_body[body] = Cat(args_valid_terms).all()
+
         for transaction in method_map.transactions:
 
-            def validate_args_for_method(method: MBody):
-                calls = method_map.info_by_call[(transaction, method)]
-                combined = OneHotMux.create(m, [(call.enable, call.arg) for call in calls])
-                return method._validate_arguments(Cat(call.enable for call in calls).any(), combined)
+            runnable_terms = [body.ready for body in method_map.ready_for_transaction(transaction)]
 
-            runnable_terms = [
-                validate_args_for_method(method) for method in method_map.methods_by_transaction[transaction]
-            ]
+            if transaction in args_valid_for_body:
+                runnable_terms.append(args_valid_for_body[transaction])
+
+            runnable_terms.extend(
+                ~Cat(call.enable for call in method_map.info_by_call[(transaction, body)]).any()
+                | args_valid_for_body[body]
+                for body in method_map.methods_by_transaction[transaction]
+                if body in args_valid_for_body
+            )
+
             runnable_terms.extend(
                 dep.run for body in method_map.ready_for_transaction(transaction) for dep in ready_dependencies[body]
             )

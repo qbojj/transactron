@@ -82,10 +82,9 @@ class Body(TransactionBase["Body"]):
             if any(len(ctrl_path.path) > len(self.ctrl_path.path) + 1 for ctrl_path, _, _ in calls)
         }
 
-    def _validate_arguments(self, en: Value, arg_rec: MethodStruct) -> ValueLike:
-        if self.validate_arguments is not None:
-            return self.ready & (~en | method_def_helper(self, self.validate_arguments, arg_rec))
-        return self.ready
+    def _validate_arguments(self, arg_rec: MethodStruct) -> ValueLike:
+        assert self.validate_arguments is not None
+        return method_def_helper(self, self.validate_arguments, arg_rec)
 
     @contextmanager
     def context(self, m: TModule) -> Iterator["Body"]:
