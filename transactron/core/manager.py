@@ -518,9 +518,14 @@ class TransactionManager(Elaboratable):
                 if method._body.validate_arguments is None:
                     continue
 
-                args_valid_terms.extend(
-                    ~enable | method._body._validate_arguments(arg_rec) for _, arg_rec, enable in calls
-                )
+                if method._body.nonexclusive:
+                    args_valid_terms.extend(
+                        ~enable | method._body._validate_arguments(arg_rec) for _, arg_rec, enable in calls
+                    )
+                else:
+                    any_enable = Cat(enable for _, _, enable in calls).any()
+                    arg = OneHotMux.create(m, [(enable, arg_rec) for _, arg_rec, enable in calls])
+                    args_valid_terms.append(~any_enable | method._body._validate_arguments(arg))
 
             if args_valid_terms:
                 args_valid_for_body[body] = Cat(args_valid_terms).all()
