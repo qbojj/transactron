@@ -11,7 +11,6 @@ from amaranth_types import FlatValueLike, ModuleLike, SrcLoc, SwitchKey
 from amaranth_types.types import ValueLike, ShapeLike
 from transactron.utils.transactron_helpers import get_src_loc
 from transactron.utils.typing import ValueBundle
-from transactron.utils.logging import top_assertion
 
 __all__ = [
     "mod_incr",
@@ -302,7 +301,6 @@ def one_hot_mux[T: ValueCastable](
     inputs: Sequence[tuple[ValueLike, T]],
     default: Optional[T] = None,
     priority: bool = False,
-    assert_one_hot: bool = True,
 ) -> T: ...
 
 
@@ -311,7 +309,6 @@ def one_hot_mux(
     inputs: Sequence[tuple[ValueLike, FlatValueLike]],
     default: Optional[FlatValueLike] = None,
     priority: bool = False,
-    assert_one_hot: bool = True,
 ) -> Value: ...
 
 
@@ -320,7 +317,6 @@ def one_hot_mux(
     inputs: Sequence[tuple[ValueLike, ValueLike]],
     default: Optional[ValueLike] = None,
     priority: bool = False,
-    assert_one_hot: bool = True,
 ) -> Value | ValueCastable: ...
 
 
@@ -328,7 +324,6 @@ def one_hot_mux(
     inputs: Sequence[tuple[ValueLike, ValueLike]],
     default: Optional[ValueLike] = None,
     priority: bool = False,
-    assert_one_hot: bool = False,
 ) -> Value | ValueCastable:
     """
     One-hot multiplexer.
@@ -344,8 +339,6 @@ def one_hot_mux(
     priority : bool, default False
         If True, the output corresponds to the lowest entry with set select signal.
         If False, the output is undefined if multiple select signals are set.
-    assert_one_hot : bool, default False
-        If True, an assertion is added that checks if undefined output is produced.
     """
     inputs = list(inputs)
     select = Cat(Value.cast(sel).bool() for sel, _ in inputs)
@@ -354,23 +347,8 @@ def one_hot_mux(
     if not inputs and default is None:
         raise ValueError("No inputs provided to one_hot_mux")
 
-    if default is None and assert_one_hot:
-        top_assertion(
-            select.any(),
-            "Select signal must be one-hot, but no bits are set",
-            src_loc=1,
-        )
-
     select_first = extract_lowest_set_bit(select)
     select_one_hot = select_first if priority else select
-
-    if not priority and assert_one_hot:
-        top_assertion(
-            select == select_first,
-            "Select signal must be one-hot with priority=False, select: {:b}",
-            select,
-            src_loc=1,
-        )
 
     all_sel = select_one_hot if default is None else Cat(select_one_hot, ~select.any())
     shape_cast, all_data = _uniformize_values(data if default is None else data + [default])

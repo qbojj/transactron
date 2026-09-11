@@ -205,7 +205,7 @@ class HardwareLogger:
 
         See `HardwareLogger.top_log` function for more details.
         """
-        self.top_log(logging.DEBUG, trigger, format, *args, src_loc=get_src_loc(src_loc), **kwargs)
+        self.top_log(logging.DEBUG, trigger, format, *args, src_loc=get_src_loc(src_loc), _top_module=None, **kwargs)
 
     def top_info(
         self, trigger: ValueLike, format: str, *args: ValueLike, src_loc: int | SrcLoc = 0, **kwargs: ValueLike
@@ -214,7 +214,7 @@ class HardwareLogger:
 
         See `HardwareLogger.top_log` function for more details.
         """
-        self.top_log(logging.INFO, trigger, format, *args, src_loc=get_src_loc(src_loc), **kwargs)
+        self.top_log(logging.INFO, trigger, format, *args, src_loc=get_src_loc(src_loc), _top_module=None, **kwargs)
 
     def top_warning(
         self, trigger: ValueLike, format: str, *args: ValueLike, src_loc: int | SrcLoc = 0, **kwargs: ValueLike
@@ -223,7 +223,7 @@ class HardwareLogger:
 
         See `HardwareLogger.top_log` function for more details.
         """
-        self.top_log(logging.WARNING, trigger, format, *args, src_loc=get_src_loc(src_loc), **kwargs)
+        self.top_log(logging.WARNING, trigger, format, *args, src_loc=get_src_loc(src_loc), _top_module=None, **kwargs)
 
     def top_error(
         self, trigger: ValueLike, format: str, *args: ValueLike, src_loc: int | SrcLoc = 0, **kwargs: ValueLike
@@ -232,7 +232,7 @@ class HardwareLogger:
 
         See `HardwareLogger.top_log` function for more details.
         """
-        self.top_log(logging.ERROR, trigger, format, *args, src_loc=get_src_loc(src_loc), **kwargs)
+        self.top_log(logging.ERROR, trigger, format, *args, src_loc=get_src_loc(src_loc), _top_module=None, **kwargs)
 
     def top_assertion(
         self, value: ValueLike, format: str, *args: ValueLike, src_loc: int | SrcLoc = 0, **kwargs: ValueLike
@@ -275,7 +275,7 @@ class HardwareLogger:
         """
         trigger_signal = Signal()
         m.d.comb += trigger_signal.eq(Value.cast(trigger).any())
-        self.top_log(level, trigger_signal, format, *args, src_loc=get_src_loc(src_loc), **kwargs)
+        self.top_log(level, trigger_signal, format, *args, src_loc=get_src_loc(src_loc), _top_module=m, **kwargs)
 
     def debug(
         self,
