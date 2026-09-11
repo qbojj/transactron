@@ -7,6 +7,7 @@ from amaranth_types import ModuleLike, ValueLike
 
 from transactron.utils.transactron_helpers import SrcLoc, get_src_loc, local_src_loc
 from transactron.utils.dependencies import DependencyContext, ListKey, SimpleKey
+from transactron.utils.amaranth_ext.functions import to_signal
 
 from .event import Event, static_to_raw
 
@@ -127,9 +128,11 @@ class EventSource:
             return
         trigger = Signal()
         m.d.comb += trigger.eq(Value.cast(when).any())
-        self.top_emit(ev, when=trigger, src_loc=get_src_loc(src_loc))
+        self.top_emit(ev, when=trigger, src_loc=get_src_loc(src_loc), _top_module=m)
 
-    def top_emit(self, ev: Event, *, when: ValueLike = 1, src_loc: int | SrcLoc = 0):
+    def top_emit(
+        self, ev: Event, *, when: ValueLike = 1, src_loc: int | SrcLoc = 0, _top_module: ModuleLike | None = None
+    ):
         """Registers an event emission site.
 
         Unlike `EventSource.emit`, this function ignores `m.If` etc. and can
@@ -140,6 +143,12 @@ class EventSource:
         if not evlog_enabled():
             return
 
+        def try_to_signal(v):
+            v = Value.cast(v)
+            if _top_module is not None:
+                return to_signal(_top_module, v)
+            return v
+
         cls = type(ev)
         if not (isinstance(ev, Event) and hasattr(cls, "event_name")):
             raise TypeError(f"Emitted object must be an instance of an @event-decorated Event subclass, got: {ev!r}")
@@ -149,7 +158,7 @@ class EventSource:
             value = getattr(ev, name)
             if not isinstance(value, (Value, ValueCastable, int, bool)):
                 raise TypeError(f"Dynamic field '{name}' of event '{cls.event_name}' must be an Amaranth value")
-            fields[name] = Value.cast(value)
+            fields[name] = try_to_signal(value)
 
         statics: dict[str, Any] = {}
         for name in cls._static_fields:
@@ -162,7 +171,7 @@ class EventSource:
             source_name=self.name,
             event_type=cls,
             location=local_src_loc(get_src_loc(src_loc)),
-            trigger=Value.cast(when).any(),
+            trigger=try_to_signal(Value.cast(when).any()),
             fields=fields,
             statics=statics,
         )

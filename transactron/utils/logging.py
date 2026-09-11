@@ -9,6 +9,7 @@ from amaranth_types import ModuleLike, ValueLike
 
 from transactron.utils.transactron_helpers import SrcLoc, get_src_loc, local_src_loc
 from transactron.utils.dependencies import DependencyContext, ListKey
+from transactron.utils.amaranth_ext.functions import to_signal
 
 
 __all__ = [
@@ -158,6 +159,7 @@ class HardwareLogger:
         format: str,
         *args: ValueLike,
         src_loc: int | SrcLoc = 0,
+        _top_module: ModuleLike | None = None,
         **kwargs: ValueLike,
     ):
         """Registers a hardware log record with the given severity.
@@ -168,7 +170,11 @@ class HardwareLogger:
         See `HardwareLogger.log` function for more details.
         """
         src_loc = local_src_loc(get_src_loc(src_loc))
-        trigger = Value.cast(trigger).any()
+
+        def try_to_signal(v):
+            return to_signal(_top_module, v) if _top_module is not None else v
+
+        trigger = try_to_signal(Value.cast(trigger).any())
 
         format_spec: list[LogChunkInfo] = []
         values: list[Value] = []
@@ -178,7 +184,7 @@ class HardwareLogger:
             else:
                 val, fmt = chunk
                 format_spec.append(LogChunkInfo(True, fmt))
-                values.append(val)
+                values.append(try_to_signal(val))
 
         record = LogRecord(
             logger_name=self.name,
